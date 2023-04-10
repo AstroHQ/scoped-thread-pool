@@ -6,13 +6,10 @@
 //! A flexible thread pool providing scoped threads.
 //!
 
-extern crate crossbeam;
-extern crate variance;
-
 #[macro_use]
 extern crate scopeguard;
 
-use crossbeam::queue::SegQueue;
+use crossbeam_channel::{bounded, Receiver, Sender};
 use variance::InvariantLifetime as Id;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -134,7 +131,10 @@ impl Pool {
     #[inline]
     pub fn shutdown(&self) {
         // Start the shutdown process.
-        self.inner.queue.push(PoolMessage::Quit);
+        self.inner
+            .queue_tx
+            .send(PoolMessage::Quit)
+            .expect("receiving thread should be running");
 
         // Wait for it to complete.
         self.wait.join()
@@ -171,12 +171,15 @@ impl Pool {
         let mut thread_sentinel = ThreadSentinel(Some(self.clone()));
 
         loop {
-            match self.inner.queue.pop() {
-                Some(e) => match e {
+            match self.inner.queue_rx.recv() {
+                Ok(msg) => match msg {
                     // On Quit, repropogate and quit.
                     PoolMessage::Quit => {
                         // Repropogate the Quit message to other threads.
-                        self.inner.queue.push(PoolMessage::Quit);
+                        self.inner
+                            .queue_tx
+                            .send(PoolMessage::Quit)
+                            .expect("receiving thread should be running");
 
                         // Cancel the thread sentinel so we don't panic waiting
                         // shutdown threads, and don't restart the thread.
@@ -193,14 +196,15 @@ impl Pool {
                         sentinel.cancel();
                     }
                 },
-                None => continue,
+                Err(_e) => continue,
             }
         }
     }
 }
 
 struct PoolInner {
-    queue: SegQueue<PoolMessage>,
+    queue_tx: Sender<PoolMessage>,
+    queue_rx: Receiver<PoolMessage>,
     thread_config: ThreadConfig,
     thread_counter: AtomicUsize,
 }
@@ -216,8 +220,10 @@ impl PoolInner {
 
 impl Default for PoolInner {
     fn default() -> Self {
+        let (queue_tx, queue_rx) = bounded(2);
         PoolInner {
-            queue: SegQueue::new(),
+            queue_tx,
+            queue_rx,
             thread_config: ThreadConfig::default(),
             thread_counter: AtomicUsize::new(1),
         }
@@ -318,8 +324,9 @@ impl<'scope> Scope<'scope> {
         // Submit the task to be executed.
         self.pool
             .inner
-            .queue
-            .push(PoolMessage::Task(task, self.wait.clone()));
+            .queue_tx
+            .send(PoolMessage::Task(task, self.wait.clone()))
+            .expect("receiving thread should be running");
     }
 
     /// Add a job to this scope which itself will get access to the scope.
